@@ -73,7 +73,12 @@ namespace SimpleWeb {
       friend class SocketServer<socket_type>;
 
     public:
-      Connection(std::unique_ptr<socket_type> &&socket) noexcept : socket(std::move(socket)), timeout_idle(0), strand(this->socket->get_io_service()), closed(false) {}
+        Connection(std::unique_ptr<socket_type> &&socket) noexcept
+            : socket(std::move(socket)),
+              timeout_idle(0),
+              strand(this->socket->get_io_service()),
+              closed(false),
+              id(0) { }
 
       std::string method, path, query_string, http_version;
 
@@ -96,6 +101,14 @@ namespace SimpleWeb {
         return remote_endpoint.port();
       }
 
+        void setId(unsigned long _id) {
+            id = _id;
+        }
+
+        unsigned long getId() {
+            return id;
+        }
+
     private:
       template <typename... Args>
       Connection(std::shared_ptr<ScopeRunner> handler_runner, long timeout_idle, Args &&... args) noexcept
@@ -108,6 +121,7 @@ namespace SimpleWeb {
 
       asio::streambuf read_buffer;
 
+        unsigned long id;
       long timeout_idle;
       std::unique_ptr<asio::steady_timer> timer;
       std::mutex timer_mutex;
