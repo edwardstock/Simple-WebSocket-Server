@@ -72,7 +72,8 @@ namespace SimpleWeb {
 #if OPENSSL_VERSION_NUMBER <= 0x1000114fL
         bio = BIO_new_mem_buf((char *)&base64[0], static_cast<int>(base64.size()));
 #else
-          bio = BIO_new_mem_buf(const_cast<void *>(&base64[0]), static_cast<int>(base64.size()));
+          bio = BIO_new_mem_buf(const_cast<void *>(reinterpret_cast<const void *>(&base64[0])),
+                                static_cast<int>(base64.size()));
 #endif
         bio = BIO_push(b64, bio);
 
