@@ -10,9 +10,12 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <functional>
 #include <thread>
 #include <unordered_set>
 #include <toolboxpp.h>
+#include <string>
+#include <boost/thread.hpp>
 
 #ifdef USE_STANDALONE_ASIO
 #include <asio.hpp>
@@ -27,7 +30,7 @@ namespace SimpleWeb {
 #include <boost/asio/steady_timer.hpp>
 namespace SimpleWeb {
 namespace asio = boost::asio;
-using error_code = boost::system::error_code;
+using ErrorCode = boost::system::error_code;
 namespace errc = boost::system::errc;
 namespace make_error_code = boost::system::errc;
 } // namespace SimpleWeb
@@ -41,12 +44,16 @@ namespace SimpleWeb {
 }
 #else
 #include <regex>
+
 namespace SimpleWeb {
 namespace regex = std;
 }
 #endif
 
 namespace SimpleWeb {
+
+using SendCallback = std::function<void(const boost::system::error_code, std::size_t)>;
+
 template<class socket_type>
 class SocketServer;
 
@@ -76,30 +83,27 @@ class SocketServerBase {
      public:
         Connection(std::unique_ptr<socket_type> &&socket) noexcept
             : socket(std::move(socket)),
-              timeout_idle(0),
+              timeoutIdle(0),
               strand(this->socket->get_io_service()),
               closed(false),
               id(0) { }
 
-        std::string method, path, query_string, http_version;
-
+        std::string method, path, queryString, httpVersion;
         CaseInsensitiveMultimap header;
+        regex::smatch pathMatch;
+        asio::ip::tcp::endpoint remoteEndpoint;
 
-        regex::smatch path_match;
-
-        asio::ip::tcp::endpoint remote_endpoint;
-
-        std::string remote_endpoint_address() const noexcept {
+        std::string remoteEndpointAddress() const noexcept {
             try {
-                return remote_endpoint.address().to_string();
+                return remoteEndpoint.address().to_string();
             }
             catch (...) {
                 return std::string();
             }
         }
 
-        unsigned short remote_endpoint_port() const noexcept {
-            return remote_endpoint.port();
+        unsigned short remoteEndpointPort() const noexcept {
+            return remoteEndpoint.port();
         }
 
         void setId(unsigned long _id) {
@@ -117,51 +121,67 @@ class SocketServerBase {
 
             using toolboxpp::strings::substringReplaceAll;
             std::stringstream ss;
-            ss << substringReplaceAll(".", "", remote_endpoint_address()) << remote_endpoint_port();
+            ss << substringReplaceAll(".", "", remoteEndpointAddress()) << remoteEndpointPort();
             uniqueId = std::stoul(ss.str());
 
             return uniqueId;
         }
 
      private:
+        class SendData {
+         public:
+            SendData(std::shared_ptr<SendStream> headerStream,
+                     std::shared_ptr<SendStream> messageStream,
+                     SimpleWeb::SendCallback callback) noexcept
+                : headerStream(std::move(headerStream)),
+                  messageStream(std::move(messageStream)),
+                  callback(std::move(callback)) { }
+
+            std::shared_ptr<SendStream> headerStream;
+            std::shared_ptr<SendStream> messageStream;
+            SimpleWeb::SendCallback callback;
+        };
+
         template<typename... Args>
         Connection(std::shared_ptr<ScopeRunner> handler_runner, long timeout_idle, Args &&... args) noexcept
-            : handler_runner(std::move(handler_runner)),
+            : handlerRunner(std::move(handler_runner)),
               socket(new socket_type(std::forward<Args>(args)...)),
-              timeout_idle(timeout_idle),
-              strand(socket->get_io_service()),
-              closed(false) { }
+              closed(false),
+              timeoutIdle(timeout_idle),
+              strand(socket->get_io_service()) { }
 
-        std::shared_ptr<ScopeRunner> handler_runner;
+        std::shared_ptr<ScopeRunner> handlerRunner;
 
-        std::unique_ptr<socket_type>
-            socket; // Socket must be unique_ptr since asio::ssl::stream<asio::ip::tcp::socket> is not movable
-        std::mutex socket_close_mutex;
-
-        asio::streambuf read_buffer;
+        /// \brief Socket must be unique_ptr since asio::ssl::stream<asio::ip::tcp::socket> is not movable
+        std::unique_ptr<socket_type> socket;
+        std::mutex socketCloseMutex;
+        std::list<SendData> sendQueue;
+        asio::streambuf readBuffer;
+        std::atomic<bool> closed;
 
         unsigned long id;
         mutable unsigned long uniqueId = 0;
-        long timeout_idle;
+        long timeoutIdle;
         std::unique_ptr<asio::steady_timer> timer;
-        std::mutex timer_mutex;
+        std::mutex timerMutex;
+        asio::io_service::strand strand;
 
         void close() noexcept {
-            error_code ec;
-            std::unique_lock<std::mutex>
-                lock(socket_close_mutex); // The following operations seems to be needed to run sequentially
+            ErrorCode ec;
+            /// The following operations seems to be needed to run sequentially
+            std::unique_lock<std::mutex> lock(socketCloseMutex);
             socket->lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_both, ec);
             socket->lowest_layer().close(ec);
         }
 
-        void set_timeout(long seconds = -1) noexcept {
-            bool use_timeout_idle = false;
-            if (seconds == -1) {
-                use_timeout_idle = true;
-                seconds = timeout_idle;
+        void timeoutSet(long seconds = -1L) noexcept {
+            bool useTimeoutIdle = false;
+            if (seconds == -1L) {
+                useTimeoutIdle = true;
+                seconds = timeoutIdle;
             }
 
-            std::unique_lock<std::mutex> lock(timer_mutex);
+            std::unique_lock<std::mutex> lock(timerMutex);
 
             if (seconds == 0) {
                 timer = nullptr;
@@ -170,37 +190,38 @@ class SocketServerBase {
 
             timer = std::unique_ptr<asio::steady_timer>(new asio::steady_timer(socket->get_io_service()));
             timer->expires_from_now(std::chrono::seconds(seconds));
-            std::weak_ptr<Connection> connection_weak
+            std::weak_ptr<Connection> connectionWeak
                 (this->shared_from_this()); // To avoid keeping Connection instance alive longer than needed
-            timer->async_wait([connection_weak, use_timeout_idle](const error_code &ec) {
+            timer->async_wait([connectionWeak, useTimeoutIdle](const ErrorCode &ec) {
               if (!ec) {
-                  if (auto connection = connection_weak.lock()) {
-                      if (use_timeout_idle)
-                          connection->send_close(1000, "idle timeout"); // 1000=normal closure
-                      else
+                  if (auto connection = connectionWeak.lock()) {
+                      if (useTimeoutIdle) {
+                          connection->sendClose(1000, "idle timeout"); // 1000=normal closure
+                      } else {
                           connection->close();
+                      }
                   }
               }
             });
         }
 
-        void cancel_timeout() noexcept {
-            std::unique_lock<std::mutex> lock(timer_mutex);
+        void timeoutCancel() noexcept {
+            std::unique_lock<std::mutex> lock(timerMutex);
             if (timer) {
-                error_code ec;
+                ErrorCode ec;
                 timer->cancel(ec);
             }
         }
 
-        bool generate_handshake(const std::shared_ptr<asio::streambuf> &write_buffer) {
-            std::ostream handshake(write_buffer.get());
+        bool handshakeGenerate(const std::shared_ptr<asio::streambuf> &writeBuffer) {
+            std::ostream handshake(writeBuffer.get());
 
-            auto header_it = header.find("Sec-WebSocket-Key");
-            if (header_it == header.end())
+            auto headerIterator = header.find("Sec-WebSocket-Key");
+            if (headerIterator == header.end())
                 return false;
 
-            static auto ws_magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-            auto sha1 = Crypto::sha1(header_it->second + ws_magic_string);
+            static auto wsMagicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+            auto sha1 = Crypto::sha1(headerIterator->second + wsMagicString);
 
             handshake << "HTTP/1.1 101 Web Socket Protocol Handshake\r\n";
             handshake << "Upgrade: websocket\r\n";
@@ -211,64 +232,52 @@ class SocketServerBase {
             return true;
         }
 
-        asio::io_service::strand strand;
+        void sendFromQueue() {
+            const std::shared_ptr<Connection> self = this->shared_from_this();
 
-        class SendData {
-         public:
-            SendData(std::shared_ptr<SendStream> header_stream, std::shared_ptr<SendStream> message_stream,
-                     std::function<void(const error_code)> &&callback) noexcept
-                : header_stream(std::move(header_stream)),
-                  message_stream(std::move(message_stream)),
-                  callback(std::move(callback)) { }
-            std::shared_ptr<SendStream> header_stream;
-            std::shared_ptr<SendStream> message_stream;
-            std::function<void(const error_code)> callback;
-        };
-
-        std::list<SendData> send_queue;
-
-        void send_from_queue() {
-            auto self = this->shared_from_this();
             strand.post([self]() {
-              asio::async_write(*self->socket,
-                                self->send_queue.begin()->header_stream->streambuf,
-                                self->strand.wrap([self](const error_code &ec, std::size_t /*bytes_transferred*/) {
-                                  auto lock = self->handler_runner->continue_lock();
-                                  if (!lock)
-                                      return;
-                                  if (!ec) {
-                                      asio::async_write(*self->socket,
-                                                        self->send_queue.begin()->message_stream->streambuf.data(),
-                                                        self->strand.wrap([self](const error_code &ec,
-                                                                                 std::size_t /*bytes_transferred*/) {
-                                                          auto lock = self->handler_runner->continue_lock();
-                                                          if (!lock)
-                                                              return;
-                                                          auto send_queued = self->send_queue.begin();
-                                                          if (send_queued->callback)
-                                                              send_queued->callback(ec);
-                                                          if (!ec) {
-                                                              self->send_queue.erase(send_queued);
-                                                              if (self->send_queue.size() > 0)
-                                                                  self->send_from_queue();
-                                                          } else
-                                                              self->send_queue.clear();
-                                                        }));
-                                  } else {
-                                      auto send_queued = self->send_queue.begin();
-                                      if (send_queued->callback)
-                                          send_queued->callback(ec);
-                                      self->send_queue.clear();
-                                  }
-                                }));
+
+              std::vector<asio::const_buffer> bufs(2);
+              const SendData data = ((SendData) *self->sendQueue.begin());
+              // headers
+              bufs.push_back(data.headerStream->streambuf.data());
+              // body
+              bufs.push_back(data.messageStream->streambuf.data());
+
+              asio::async_write(*self->socket, bufs, self->strand.wrap([self](const ErrorCode &ec, std::size_t ts) {
+                std::unique_ptr<ScopeRunner::SharedLock> lock = self->handlerRunner->continueLock();
+                if (!lock) {
+                    return;
+                }
+
+                const SendData sendDataQueued = ((SendData) *self->sendQueue.begin());
+                // if error occured, cleanup queue
+                if (ec) {
+                    if (sendDataQueued.callback) {
+                        sendDataQueued.callback(ec, ts);
+                    }
+
+                    self->sendQueue.clear();
+
+                    return;
+                }
+
+                if (sendDataQueued.callback) {
+                    sendDataQueued.callback(ec, ts);
+                }
+
+                self->sendQueue.erase(self->sendQueue.begin());
+                if (self->sendQueue.size() > 0) {
+                    self->sendFromQueue();
+                }
+              }));
+
             });
         }
 
-        std::atomic<bool> closed;
-
-        void read_remote_endpoint() noexcept {
+        void readRemoteEndpoint() noexcept {
             try {
-                remote_endpoint = socket->lowest_layer().remote_endpoint();
+                remoteEndpoint = socket->lowest_layer().remote_endpoint();
             }
             catch (...) {
             }
@@ -277,58 +286,58 @@ class SocketServerBase {
      public:
         /// fin_rsv_opcode: 129=one fragment, text, 130=one fragment, binary, 136=close connection.
         /// See http://tools.ietf.org/html/rfc6455#section-5.2 for more information
-        void send(const std::shared_ptr<SendStream> &message_stream,
-                  const std::function<void(const error_code &)> &callback = nullptr,
-                  unsigned char fin_rsv_opcode = 129) {
-            cancel_timeout();
-            set_timeout();
+        void send(std::shared_ptr<SendStream> messageStream,
+                  const SendCallback &callback = nullptr,
+                  uint8_t fin_rsv_opcode = 129) {
+            timeoutCancel();
+            timeoutSet();
 
-            auto header_stream = std::make_shared<SendStream>();
+            std::shared_ptr<SendStream> headerStream = std::make_shared<SendStream>();
+            std::size_t length = messageStream->size();
 
-            std::size_t length = message_stream->size();
-
-            header_stream->put(static_cast<char>(fin_rsv_opcode));
+            headerStream->put(static_cast<char>(fin_rsv_opcode));
             // Unmasked (first length byte<128)
             if (length >= 126) {
-                std::size_t num_bytes;
+                std::size_t numBytes;
                 if (length > 0xffff) {
-                    num_bytes = 8;
-                    header_stream->put(127);
+                    numBytes = 8;
+                    headerStream->put(127);
                 } else {
-                    num_bytes = 2;
-                    header_stream->put(126);
+                    numBytes = 2;
+                    headerStream->put(126);
                 }
 
-                for (std::size_t c = num_bytes - 1; c != static_cast<std::size_t>(-1); c--)
-                    header_stream->put((static_cast<unsigned long long>(length) >> (8 * c)) % 256);
-            } else
-                header_stream->put(static_cast<char>(length));
+                for (std::size_t c = numBytes - 1; c != static_cast<std::size_t>(-1); c--)
+                    headerStream->put(static_cast<char>((length >> (8 * c)) % 256));
+            } else {
+                headerStream->put(static_cast<char>(length));
+            }
 
-            auto self = this->shared_from_this();
-            strand.post([self, header_stream, message_stream, callback]() {
-              self->send_queue.emplace_back(header_stream, message_stream, callback);
-              if (self->send_queue.size() == 1)
-                  self->send_from_queue();
+            const std::shared_ptr<Connection> self = this->shared_from_this();
+            strand.post([self, headerStream, messageStream, callback]() {
+              self->sendQueue.emplace_back(std::move(headerStream), std::move(messageStream), std::move(callback));
+              if (self->sendQueue.size() == 1)
+                  self->sendFromQueue();
             });
         }
 
-        void send_close(int status,
-                        const std::string &reason = "",
-                        const std::function<void(const error_code &)> &callback = nullptr) {
+        void sendClose(int status, const std::string &reason = "", const SendCallback &callback = nullptr) {
             // Send close only once (in case close is initiated by server)
-            if (closed)
+            if (closed) {
                 return;
+            }
+
             closed = true;
 
-            auto send_stream = std::make_shared<SendStream>();
+            auto sendStream = std::make_shared<SendStream>();
 
-            send_stream->put(status >> 8);
-            send_stream->put(status % 256);
+            sendStream->put(static_cast<char>(status >> 8));
+            sendStream->put(static_cast<char>(status % 256));
 
-            *send_stream << reason;
+            *sendStream << reason;
 
             // fin_rsv_opcode=136: message close
-            send(send_stream, callback, 136);
+            send(std::move(sendStream), callback, 136);
         }
     };
 
@@ -347,8 +356,7 @@ class SocketServerBase {
                 std::stringstream ss;
                 ss << rdbuf();
                 return ss.str();
-            }
-            catch (...) {
+            } catch (...) {
                 return std::string();
             }
         }
@@ -364,16 +372,16 @@ class SocketServerBase {
 
      private:
         std::unordered_set<std::shared_ptr<Connection>> connections;
-        std::mutex connections_mutex;
+        std::mutex connectionsMutex;
 
      public:
-        std::function<void(std::shared_ptr<Connection>)> on_open;
-        std::function<void(std::shared_ptr<Connection>, std::shared_ptr<Message>)> on_message;
-        std::function<void(std::shared_ptr<Connection>, int, const std::string &)> on_close;
-        std::function<void(std::shared_ptr<Connection>, const error_code &)> on_error;
+        std::function<void(std::shared_ptr<Connection>)> onOpen;
+        std::function<void(std::shared_ptr<Connection>, std::shared_ptr<Message>)> onMessage;
+        std::function<void(std::shared_ptr<Connection>, int, const std::string &)> onClose;
+        std::function<void(std::shared_ptr<Connection>, const ErrorCode &)> onError;
 
-        std::unordered_set<std::shared_ptr<Connection>> get_connections() noexcept {
-            std::unique_lock<std::mutex> lock(connections_mutex);
+        std::unordered_set<std::shared_ptr<Connection>> getConnections() noexcept {
+            std::unique_lock<std::mutex> lock(connectionsMutex);
             auto copy = connections;
             return copy;
         }
@@ -390,108 +398,106 @@ class SocketServerBase {
         unsigned short port;
         /// If io_service is not set, number of threads that the server will use when start() is called.
         /// Defaults to 1 thread.
-        std::size_t thread_pool_size = 1;
+        std::size_t threadPoolSize = 1;
         /// Timeout on request handling. Defaults to 5 seconds.
-        long timeout_request = 5;
+        long timeoutRequest = 5;
         /// Idle timeout. Defaults to no timeout.
-        long timeout_idle = 0;
+        long timeoutIdle = 0;
         /// Maximum size of incoming messages. Defaults to architecture maximum.
         /// Exceeding this limit will result in a message_size error code and the connection will be closed.
-        std::size_t max_message_size = std::numeric_limits<std::size_t>::max();
+        std::size_t maxMessageSize = std::numeric_limits<std::size_t>::max();
         /// IPv4 address in dotted decimal form or IPv6 address in hexadecimal notation.
         /// If empty, the address will be any address.
         std::string address;
         /// Set to false to avoid binding the socket to an address that is already in use. Defaults to true.
-        bool reuse_address = true;
+        bool reuseAddress = true;
     };
     /// Set before calling start().
     Config config;
 
  private:
-    class regex_orderable : public regex::regex {
+    class RegexOrderable : public regex::regex {
         std::string str;
 
      public:
-        regex_orderable(const char *regex_cstr) : regex::regex(regex_cstr), str(regex_cstr) { }
-        regex_orderable(const std::string &regex_str) : regex::regex(regex_str), str(regex_str) { }
-        bool operator<(const regex_orderable &rhs) const noexcept {
+        RegexOrderable(const char *regex_cstr) : regex::regex(regex_cstr), str(regex_cstr) { }
+        RegexOrderable(const std::string &regex_str) : regex::regex(regex_str), str(regex_str) { }
+        bool operator<(const RegexOrderable &rhs) const noexcept {
             return str < rhs.str;
         }
     };
 
  public:
     /// Warning: do not add or remove endpoints after start() is called
-    std::map<regex_orderable, Endpoint> endpoint;
+    std::map<RegexOrderable, Endpoint> endpoint;
 
     virtual void start() {
-        if (!io_service) {
-            io_service = std::make_shared<asio::io_service>();
-            internal_io_service = true;
+        if (!ioService) {
+            ioService = std::make_shared<asio::io_service>();
+            internalIoService = true;
         }
 
-        if (io_service->stopped())
-            io_service->reset();
+        if (ioService->stopped()) {
+            ioService->reset();
+        }
 
         asio::ip::tcp::endpoint endpoint;
-        if (config.address.size() > 0)
+        if (config.address.size() > 0) {
             endpoint = asio::ip::tcp::endpoint(asio::ip::address::from_string(config.address), config.port);
-        else
+        } else {
             endpoint = asio::ip::tcp::endpoint(asio::ip::tcp::v4(), config.port);
+        }
 
-        if (!acceptor)
-            acceptor = std::unique_ptr<asio::ip::tcp::acceptor>(new asio::ip::tcp::acceptor(*io_service));
+        if (!acceptor) {
+            acceptor = std::unique_ptr<asio::ip::tcp::acceptor>(new asio::ip::tcp::acceptor(*ioService));
+        }
+
         acceptor->open(endpoint.protocol());
-        acceptor->set_option(asio::socket_base::reuse_address(config.reuse_address));
+        acceptor->set_option(asio::socket_base::reuse_address(config.reuseAddress));
         acceptor->bind(endpoint);
         acceptor->listen();
 
         accept();
 
-        if (internal_io_service) {
+        if (internalIoService) {
             // If thread_pool_size>1, start m_io_service.run() in (thread_pool_size-1) threads for thread-pooling
-            threads.clear();
-            for (std::size_t c = 1; c < config.thread_pool_size; c++) {
-                threads.emplace_back([this]() {
-                  io_service->run();
-                });
+            for (std::size_t c = 1; c < config.threadPoolSize; c++) {
+                threadGroup.create_thread(
+                    boost::bind(&boost::asio::io_service::run, ioService)
+                );
             }
             // Main thread
-            if (config.thread_pool_size > 0)
-                io_service->run();
+            if (config.threadPoolSize > 0) {
+                ioService->run();
+            }
 
             // Wait for the rest of the threads, if any, to finish as well
-            for (auto &t : threads)
-                t.join();
+            threadGroup.join_all();
         }
     }
 
     void stop() noexcept {
         if (acceptor) {
-            error_code ec;
+            ErrorCode ec;
             acceptor->close(ec);
 
             for (auto &pair : endpoint) {
-                std::unique_lock<std::mutex> lock(pair.second.connections_mutex);
-                for (auto &connection : pair.second.connections)
+                std::unique_lock<std::mutex> lock(pair.second.connectionsMutex);
+                for (auto &connection : pair.second.connections) {
                     connection->close();
+                }
                 pair.second.connections.clear();
             }
 
-            if (internal_io_service)
-                io_service->stop();
+            if (internalIoService) {
+                ioService->stop();
+            }
+
+            threadGroup.interrupt_all();
         }
     }
 
     virtual ~SocketServerBase() noexcept { }
-
-    std::unordered_set<std::shared_ptr<Connection>> get_connections() noexcept {
-        std::unordered_set<std::shared_ptr<Connection>> all_connections;
-        for (auto &e : endpoint) {
-            std::unique_lock<std::mutex> lock(e.second.connections_mutex);
-            all_connections.insert(e.second.connections.begin(), e.second.connections.end());
-        }
-        return all_connections;
-    }
 
     /**
      * Upgrades a request, from for instance Simple-Web-Server, to a WebSocket connection.
@@ -512,290 +518,318 @@ class SocketServerBase {
      * }
      */
     void upgrade(const std::shared_ptr<Connection> &connection) {
-        connection->handler_runner = handler_runner;
-        connection->timeout_idle = config.timeout_idle;
-        write_handshake(connection);
+        connection->handlerRunner = handlerRunner;
+        connection->timeoutIdle = config.timeoutIdle;
+        handshakeWrite(connection);
     }
 
     /// If you have your own asio::io_service, store its pointer here before running start().
-    std::shared_ptr<asio::io_service> io_service;
+    std::shared_ptr<asio::io_service> ioService;
 
  protected:
-    bool internal_io_service = false;
+    bool internalIoService = false;
 
     std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
-    std::vector<std::thread> threads;
+    boost::thread_group threadGroup;
 
-    std::shared_ptr<ScopeRunner> handler_runner;
+    std::shared_ptr<ScopeRunner> handlerRunner;
 
-    SocketServerBase(unsigned short port) noexcept : config(port), handler_runner(new ScopeRunner()) { }
+    SocketServerBase(unsigned short port) noexcept : config(port), handlerRunner(new ScopeRunner()) { }
 
     virtual void accept() = 0;
 
-    void read_handshake(const std::shared_ptr<Connection> &connection) {
-        connection->read_remote_endpoint();
+    void handshakeRead(const std::shared_ptr<Connection> &connection) {
+        connection->readRemoteEndpoint();
 
-        connection->set_timeout(config.timeout_request);
+        connection->timeoutSet(config.timeoutRequest);
+        // reading handshake headers until \r\n\r\n
         asio::async_read_until(*connection->socket,
-                               connection->read_buffer,
+                               connection->readBuffer,
                                "\r\n\r\n",
-                               [this, connection](const error_code &ec, std::size_t /*bytes_transferred*/) {
-                                 connection->cancel_timeout();
-                                 auto lock = connection->handler_runner->continue_lock();
+                               [this, connection](const ErrorCode &ec, std::size_t /*bytes_transferred*/) {
+                                 connection->timeoutCancel();
+                                 auto lock = connection->handlerRunner->continueLock();
                                  if (!lock)
                                      return;
                                  if (!ec) {
-                                     std::istream stream(&connection->read_buffer);
+                                     std::istream stream(&connection->readBuffer);
                                      if (RequestMessage::parse(stream,
                                                                connection->method,
                                                                connection->path,
-                                                               connection->query_string,
-                                                               connection->http_version,
+                                                               connection->queryString,
+                                                               connection->httpVersion,
                                                                connection->header))
-                                         write_handshake(connection);
+
+                                         // after success incoming handshake, sending server handshake
+                                         handshakeWrite(connection);
                                  }
                                });
     }
 
-    void write_handshake(const std::shared_ptr<Connection> &connection) {
-        for (auto &regex_endpoint : endpoint) {
-            regex::smatch path_match;
-            if (regex::regex_match(connection->path, path_match, regex_endpoint.first)) {
-                auto write_buffer = std::make_shared<asio::streambuf>();
+    void handshakeWrite(const std::shared_ptr<Connection> &connection) {
+        for (auto &regexEndpoint : endpoint) {
+            regex::smatch pathMatch;
+            if (regex::regex_match(connection->path, pathMatch, regexEndpoint.first)) {
+                auto writeBuffer = std::make_shared<asio::streambuf>();
 
-                if (connection->generate_handshake(write_buffer)) {
-                    connection->path_match = std::move(path_match);
-                    connection->set_timeout(config.timeout_request);
-                    asio::async_write(*connection->socket,
-                                      *write_buffer,
-                                      [this, connection, write_buffer, &regex_endpoint](const error_code &ec,
-                                                                                        std::size_t /*bytes_transferred*/) {
-                                        connection->cancel_timeout();
-                                        auto lock = connection->handler_runner->continue_lock();
-                                        if (!lock)
-                                            return;
-                                        if (!ec) {
-                                            connection_open(connection, regex_endpoint.second);
-                                            read_message(connection, regex_endpoint.second);
-                                        } else
-                                            connection_error(connection, regex_endpoint.second, ec);
-                                      });
+                if (connection->handshakeGenerate(writeBuffer)) {
+                    connection->pathMatch = std::move(pathMatch);
+                    connection->timeoutSet(config.timeoutRequest);
+                    asio::async_write(
+                        *connection->socket,
+                        *writeBuffer,
+                        [this, connection, writeBuffer, &regexEndpoint](const ErrorCode &ec, std::size_t) {
+                          connection->timeoutCancel();
+                          auto lock = connection->handlerRunner->continueLock();
+                          if (!lock) {
+                              return;
+                          }
+
+                          if (!ec) {
+                              onConnectionOpen(connection, regexEndpoint.second);
+                              readMessage(connection, regexEndpoint.second);
+                          } else
+                              onConnectionError(connection, regexEndpoint.second, ec);
+                        });
                 }
                 return;
             }
         }
     }
 
-    void read_message(const std::shared_ptr<Connection> &connection, Endpoint &endpoint) const {
-        asio::async_read(*connection->socket,
-                         connection->read_buffer,
-                         asio::transfer_exactly(2),
-                         [this, connection, &endpoint](const error_code &ec, std::size_t bytes_transferred) {
-                           auto lock = connection->handler_runner->continue_lock();
-                           if (!lock)
-                               return;
-                           if (!ec) {
-                               if (bytes_transferred == 0) { // TODO: why does this happen sometimes?
-                                   read_message(connection, endpoint);
-                                   return;
-                               }
-                               std::istream stream(&connection->read_buffer);
+    void readMessage(const std::shared_ptr<Connection> &connection, Endpoint &endpoint) const {
+        connection->strand.post([this, connection, &endpoint] {
+          // first read - detecting size
+          asio::async_read(*connection->socket,
+                           connection->readBuffer,
+                           asio::transfer_exactly(2),
+                           connection->strand.wrap([this, connection, &endpoint](const ErrorCode &ec,
+                                                                                 std::size_t bytesTransferred) {
+                             auto lock = connection->handlerRunner->continueLock();
+                             if (!lock) {
+                                 return;
+                             }
 
-                               std::vector<unsigned char> first_bytes;
-                               first_bytes.resize(2);
-                               stream.read((char *) &first_bytes[0], 2);
+                             if (ec) {
+                                 onConnectionError(connection, endpoint, ec);
+                                 return;
+                             }
 
-                               unsigned char fin_rsv_opcode = first_bytes[0];
+                             if (bytesTransferred == 0) { // TODO: why does this happen sometimes?
+                                 readMessage(connection, endpoint);
+                                 return;
+                             }
 
-                               // Close connection if unmasked message from client (protocol error)
-                               if (first_bytes[1] < 128) {
-                                   const std::string reason("message from client not masked");
-                                   connection->send_close(1002, reason);
-                                   connection_close(connection, endpoint, 1002, reason);
-                                   return;
-                               }
+                             std::istream stream(&connection->readBuffer);
 
-                               std::size_t length = (first_bytes[1] & 127);
+                             std::vector<unsigned char> firstBytes(2);
+                             stream.read((char *) &firstBytes[0], 2);
 
-                               if (length == 126) {
-                                   // 2 next bytes is the size of content
-                                   asio::async_read(*connection->socket,
-                                                    connection->read_buffer,
-                                                    asio::transfer_exactly(2),
-                                                    [this, connection, &endpoint, fin_rsv_opcode](const error_code &ec,
-                                                                                                  std::size_t /*bytes_transferred*/) {
-                                                      auto lock = connection->handler_runner->continue_lock();
-                                                      if (!lock)
-                                                          return;
-                                                      if (!ec) {
-                                                          std::istream stream(&connection->read_buffer);
+                             unsigned char fin_rsv_opcode = firstBytes[0];
 
-                                                          std::vector<unsigned char> length_bytes;
-                                                          length_bytes.resize(2);
-                                                          stream.read((char *) &length_bytes[0], 2);
+                             // Close connection if unmasked message from client (protocol error)
+                             if (firstBytes[1] < 128) {
+                                 const std::string reason("message from client not masked");
+                                 connection->sendClose(1002, reason);
+                                 connectionClose(connection, endpoint, 1002, reason);
+                                 return;
+                             }
 
-                                                          std::size_t length = 0;
-                                                          std::size_t num_bytes = 2;
-                                                          for (std::size_t c = 0; c < num_bytes; c++)
-                                                              length += static_cast<std::size_t>(length_bytes[c])
-                                                                  << (8 * (num_bytes - 1 - c));
+                             std::size_t length = (firstBytes[1] & 127u);
 
-                                                          read_message_content(connection,
-                                                                               length,
-                                                                               endpoint,
-                                                                               fin_rsv_opcode);
-                                                      } else
-                                                          connection_error(connection, endpoint, ec);
-                                                    });
-                               } else if (length == 127) {
-                                   // 8 next bytes is the size of content
-                                   asio::async_read(*connection->socket,
-                                                    connection->read_buffer,
-                                                    asio::transfer_exactly(8),
-                                                    [this, connection, &endpoint, fin_rsv_opcode](const error_code &ec,
-                                                                                                  std::size_t /*bytes_transferred*/) {
-                                                      auto lock = connection->handler_runner->continue_lock();
-                                                      if (!lock)
-                                                          return;
-                                                      if (!ec) {
-                                                          std::istream stream(&connection->read_buffer);
+                             if (length == 126) {
+                                 // if length == 126 means
+                                 // 2 next bytes is the size of content
+                                 asio::async_read(
+                                     *connection->socket,
+                                     connection->readBuffer,
+                                     asio::transfer_exactly(2),
+                                     [this, connection, &endpoint, fin_rsv_opcode](const ErrorCode &ec, std::size_t) {
+                                       auto sublock = connection->handlerRunner->continueLock();
+                                       if (!sublock) {
+                                           return;
+                                       }
 
-                                                          std::vector<unsigned char> length_bytes;
-                                                          length_bytes.resize(8);
-                                                          stream.read((char *) &length_bytes[0], 8);
+                                       if (ec) {
+                                           onConnectionError(connection, endpoint, ec);
+                                           return;
+                                       }
 
-                                                          std::size_t length = 0;
-                                                          std::size_t num_bytes = 8;
-                                                          for (std::size_t c = 0; c < num_bytes; c++)
-                                                              length += static_cast<std::size_t>(length_bytes[c])
-                                                                  << (8 * (num_bytes - 1 - c));
+                                       std::istream readStream(&connection->readBuffer);
 
-                                                          read_message_content(connection,
-                                                                               length,
-                                                                               endpoint,
-                                                                               fin_rsv_opcode);
-                                                      } else
-                                                          connection_error(connection, endpoint, ec);
-                                                    });
-                               } else
-                                   read_message_content(connection, length, endpoint, fin_rsv_opcode);
-                           } else
-                               connection_error(connection, endpoint, ec);
-                         });
+                                       std::vector<unsigned char> lengthBytes(2);
+                                       readStream.read((char *) &lengthBytes[0], 2);
+
+                                       std::size_t toReadLength = 0;
+                                       std::size_t numBytes = 2;
+                                       for (std::size_t c = 0; c < numBytes; c++) {
+                                           toReadLength +=
+                                               static_cast<std::size_t>(lengthBytes[c]) << (8 * (numBytes - 1 - c));
+                                       }
+
+                                       // now we know real content length, reading whole message
+                                       readMessageContent(connection, toReadLength, endpoint, fin_rsv_opcode);
+                                     });
+                             } else if (length == 127) {
+                                 // 8 next bytes is the size of content
+                                 asio::async_read(
+                                     *connection->socket,
+                                     connection->readBuffer,
+                                     asio::transfer_exactly(8),
+                                     [this, connection, &endpoint, fin_rsv_opcode](const ErrorCode &ec, std::size_t) {
+                                       auto lock = connection->handlerRunner->continueLock();
+                                       if (!lock) {
+                                           return;
+                                       }
+
+                                       if (ec) {
+                                           onConnectionError(connection, endpoint, ec);
+                                           return;
+                                       }
+
+                                       std::istream readStream(&connection->readBuffer);
+
+                                       std::vector<unsigned char> lengthBytes(8);
+                                       readStream.read((char *) &lengthBytes[0], 8);
+
+                                       std::size_t toReadLength = 0;
+                                       std::size_t num_bytes = 8;
+                                       for (std::size_t c = 0; c < num_bytes; c++) {
+                                           toReadLength +=
+                                               static_cast<std::size_t>(lengthBytes[c]) << (8 * (num_bytes - 1 - c));
+                                       }
+
+                                       // now we know real content length, reading whole message
+                                       readMessageContent(connection, toReadLength, endpoint, fin_rsv_opcode);
+                                     });
+                             } else {
+                                 // real message content length is that length that we have now
+                                 readMessageContent(connection, length, endpoint, fin_rsv_opcode);
+                             }
+                           }));
+        });
     }
 
-    void read_message_content(const std::shared_ptr<Connection> &connection,
-                              std::size_t length,
-                              Endpoint &endpoint,
-                              unsigned char fin_rsv_opcode) const {
-        if (length > config.max_message_size) {
-            connection_error(connection, endpoint, make_error_code::make_error_code(errc::message_size));
+    void readMessageContent(const std::shared_ptr<Connection> &connection,
+                            std::size_t length,
+                            Endpoint &endpoint,
+                            unsigned char fin_rsv_opcode) const {
+
+        if (length > config.maxMessageSize) {
+            onConnectionError(connection, endpoint, make_error_code::make_error_code(errc::message_size));
             const int status = 1009;
             const std::string reason = "message too big";
-            connection->send_close(status, reason);
-            connection_close(connection, endpoint, status, reason);
+            connection->sendClose(status, reason);
+            connectionClose(connection, endpoint, status, reason);
             return;
         }
+
         asio::async_read(*connection->socket,
-                         connection->read_buffer,
+                         connection->readBuffer,
                          asio::transfer_exactly(4 + length),
-                         [this, connection, length, &endpoint, fin_rsv_opcode](const error_code &ec,
-                                                                               std::size_t /*bytes_transferred*/) {
-                           auto lock = connection->handler_runner->continue_lock();
-                           if (!lock)
+                         [this, connection, length, &endpoint, fin_rsv_opcode](const ErrorCode &ec, std::size_t) {
+                           auto lock = connection->handlerRunner->continueLock();
+                           if (!lock) {
                                return;
-                           if (!ec) {
-                               std::istream raw_message_data(&connection->read_buffer);
+                           }
 
-                               // Read mask
-                               std::vector<unsigned char> mask;
-                               mask.resize(4);
-                               raw_message_data.read((char *) &mask[0], 4);
+                           if (ec) {
+                               onConnectionError(connection, endpoint, ec);
+                               return;
+                           }
 
-                               std::shared_ptr<Message> message(new Message());
-                               message->length = length;
-                               message->fin_rsv_opcode = fin_rsv_opcode;
+                           std::istream rawMessageData(&connection->readBuffer);
 
-                               std::ostream message_data_out_stream(&message->streambuf);
-                               for (std::size_t c = 0; c < length; c++) {
-                                   message_data_out_stream.put(raw_message_data.get() ^ mask[c % 4]);
+                           // Read mask
+                           std::vector<unsigned char> mask(4);
+                           rawMessageData.read((char *) &mask[0], 4);
+
+                           std::shared_ptr<Message> message(new Message());
+                           message->length = length;
+                           message->fin_rsv_opcode = fin_rsv_opcode;
+
+                           std::ostream messageDataOutStream(&message->streambuf);
+                           for (std::size_t c = 0; c < length; c++) {
+                               messageDataOutStream.put(rawMessageData.get() ^ mask[c % 4]);
+                           }
+
+                           // If connection close
+                           if ((fin_rsv_opcode & 0x0f) == 8) {
+                               int status = 0;
+                               if (length >= 2) {
+                                   unsigned char byte1 = static_cast<unsigned char>(message->get());
+                                   unsigned char byte2 = static_cast<unsigned char>(message->get());
+                                   status = (byte1 << 8) + byte2;
                                }
 
-                               // If connection close
-                               if ((fin_rsv_opcode & 0x0f) == 8) {
-                                   int status = 0;
-                                   if (length >= 2) {
-                                       unsigned char byte1 = message->get();
-                                       unsigned char byte2 = message->get();
-                                       status = (byte1 << 8) + byte2;
-                                   }
-
-                                   auto reason = message->string();
-                                   connection->send_close(status, reason);
-                                   connection_close(connection, endpoint, status, reason);
-                                   return;
-                               } else {
-                                   // If ping
-                                   if ((fin_rsv_opcode & 0x0f) == 9) {
-                                       // Send pong
-                                       auto empty_send_stream = std::make_shared<SendStream>();
-                                       connection->send(empty_send_stream, nullptr, fin_rsv_opcode + 1);
-                                   } else if (endpoint.on_message) {
-                                       connection->cancel_timeout();
-                                       connection->set_timeout();
-                                       endpoint.on_message(connection, message);
-                                   }
-
-                                   // Next message
-                                   read_message(connection, endpoint);
+                               auto reason = message->string();
+                               connection->sendClose(status, reason);
+                               connectionClose(connection, endpoint, status, reason);
+                               return;
+                           } else {
+                               // If ping
+                               if ((fin_rsv_opcode & 0x0f) == 9) {
+                                   // Send pong
+                                   auto empty_send_stream = std::make_shared<SendStream>();
+                                   connection->send(std::move(empty_send_stream),
+                                                    nullptr,
+                                                    static_cast<unsigned char>(fin_rsv_opcode + 1));
+                               } else if (endpoint.onMessage) {
+                                   connection->timeoutCancel();
+                                   connection->timeoutSet();
+                                   endpoint.onMessage(connection, message);
                                }
-                           } else
-                               connection_error(connection, endpoint, ec);
+
+                               // Next message
+                               readMessage(connection, endpoint);
+                           }
+
                          });
     }
 
-    void connection_open(const std::shared_ptr<Connection> &connection, Endpoint &endpoint) const {
-        connection->cancel_timeout();
-        connection->set_timeout();
+    void onConnectionOpen(const std::shared_ptr<Connection> &connection, Endpoint &endpoint) const {
+        connection->timeoutCancel();
+        connection->timeoutSet();
 
         {
-            std::unique_lock<std::mutex> lock(endpoint.connections_mutex);
+            std::unique_lock<std::mutex> lock(endpoint.connectionsMutex);
             endpoint.connections.insert(connection);
         }
 
-        if (endpoint.on_open)
-            endpoint.on_open(connection);
+        if (endpoint.onOpen)
+            endpoint.onOpen(connection);
     }
 
-    void connection_close(const std::shared_ptr<Connection> &connection,
-                          Endpoint &endpoint,
-                          int status,
-                          const std::string &reason) const {
-        connection->cancel_timeout();
-        connection->set_timeout();
+    void connectionClose(const std::shared_ptr<Connection> &connection,
+                         Endpoint &endpoint,
+                         int status,
+                         const std::string &reason) const {
+        connection->timeoutCancel();
+        connection->timeoutSet();
 
         {
-            std::unique_lock<std::mutex> lock(endpoint.connections_mutex);
+            std::unique_lock<std::mutex> lock(endpoint.connectionsMutex);
             endpoint.connections.erase(connection);
         }
 
-        if (endpoint.on_close)
-            endpoint.on_close(connection, status, reason);
+        if (endpoint.onClose)
+            endpoint.onClose(connection, status, reason);
     }
 
-    void connection_error(const std::shared_ptr<Connection> &connection,
-                          Endpoint &endpoint,
-                          const error_code &ec) const {
-        connection->cancel_timeout();
-        connection->set_timeout();
+    void onConnectionError(const std::shared_ptr<Connection> &connection,
+                           Endpoint &endpoint,
+                           const ErrorCode &ec) const {
+        connection->timeoutCancel();
+        connection->timeoutSet();
 
         {
-            std::unique_lock<std::mutex> lock(endpoint.connections_mutex);
+            std::unique_lock<std::mutex> lock(endpoint.connectionsMutex);
             endpoint.connections.erase(connection);
         }
 
-        if (endpoint.on_error)
-            endpoint.on_error(connection, ec);
+        if (endpoint.onError) {
+            endpoint.onError(connection, ec);
+        }
     }
 };
 
@@ -804,6 +838,7 @@ class SocketServer : public SocketServerBase<socket_type> { };
 
 using WS = asio::ip::tcp::socket;
 
+/// @TODO socket wrapper instead of templates
 template<>
 class SocketServer<WS> : public SocketServerBase<WS> {
  public:
@@ -811,13 +846,13 @@ class SocketServer<WS> : public SocketServerBase<WS> {
 
  protected:
     void accept() override {
-        std::shared_ptr<Connection> connection(new Connection(handler_runner, config.timeout_idle, *io_service));
+        std::shared_ptr<Connection> connection(new Connection(handlerRunner, config.timeoutIdle, *ioService));
 
-        acceptor->async_accept(*connection->socket, [this, connection](const error_code &ec) {
-          auto lock = connection->handler_runner->continue_lock();
+        acceptor->async_accept(*connection->socket, [this, connection](const ErrorCode &ec) {
+          auto lock = connection->handlerRunner->continueLock();
           if (!lock)
               return;
-          // Immediately start accepting a new connection (if io_service hasn't been stopped)
+          // Immediately start accepting a new connection (if ioService hasn't been stopped)
           if (ec != asio::error::operation_aborted)
               accept();
 
@@ -825,7 +860,7 @@ class SocketServer<WS> : public SocketServerBase<WS> {
               asio::ip::tcp::no_delay option(true);
               connection->socket->set_option(option);
 
-              read_handshake(connection);
+              handshakeRead(connection);
           }
         });
     }

@@ -308,7 +308,7 @@ namespace SimpleWeb {
 #endif
 
 namespace SimpleWeb {
-  /// Makes it possible to for instance cancel Asio handlers without stopping asio::io_service
+/// Makes it possible to for instance cancel Asio handlers without stopping asio::ioService
   class ScopeRunner {
     /// Scope count that is set to -1 if scopes are to be canceled
     std::atomic<long> count;
@@ -330,7 +330,7 @@ namespace SimpleWeb {
     ScopeRunner() noexcept : count(0) {}
 
     /// Returns nullptr if scope should be exited, or a shared lock otherwise
-    std::unique_ptr<SharedLock> continue_lock() noexcept {
+    std::unique_ptr<SharedLock> continueLock() noexcept {
       long expected = count;
       while(expected >= 0 && !count.compare_exchange_weak(expected, expected + 1))
         spin_loop_pause();
