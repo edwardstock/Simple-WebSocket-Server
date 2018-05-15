@@ -154,7 +154,7 @@ namespace SimpleWeb {
         auto self = this->shared_from_this();
         strand.post([self]() {
           asio::async_write(*self->socket, self->send_queue.begin()->send_stream->streambuf, self->strand.wrap([self](const error_code &ec, std::size_t /*bytes_transferred*/) {
-            auto lock = self->handler_runner->continue_lock();
+            auto lock = self->handler_runner->continueLock();
             if(!lock)
               return;
             auto send_queued = self->send_queue.begin();
@@ -411,14 +411,14 @@ namespace SimpleWeb {
       connection->set_timeout(config.timeout_request);
       asio::async_write(*connection->socket, *write_buffer, [this, connection, write_buffer, nonce_base64](const error_code &ec, std::size_t /*bytes_transferred*/) {
         connection->cancel_timeout();
-        auto lock = connection->handler_runner->continue_lock();
+        auto lock = connection->handler_runner->continueLock();
         if(!lock)
           return;
         if(!ec) {
           connection->set_timeout(this->config.timeout_request);
           asio::async_read_until(*connection->socket, connection->message->streambuf, "\r\n\r\n", [this, connection, nonce_base64](const error_code &ec, std::size_t /*bytes_transferred*/) {
             connection->cancel_timeout();
-            auto lock = connection->handler_runner->continue_lock();
+            auto lock = connection->handler_runner->continueLock();
             if(!lock)
               return;
             if(!ec) {
@@ -448,7 +448,7 @@ namespace SimpleWeb {
 
     void read_message(const std::shared_ptr<Connection> &connection) {
       asio::async_read(*connection->socket, connection->message->streambuf, asio::transfer_exactly(2), [this, connection](const error_code &ec, std::size_t bytes_transferred) {
-        auto lock = connection->handler_runner->continue_lock();
+        auto lock = connection->handler_runner->continueLock();
         if(!lock)
           return;
         if(!ec) {
@@ -475,7 +475,7 @@ namespace SimpleWeb {
           if(length == 126) {
             // 2 next bytes is the size of content
             asio::async_read(*connection->socket, connection->message->streambuf, asio::transfer_exactly(2), [this, connection](const error_code &ec, std::size_t /*bytes_transferred*/) {
-              auto lock = connection->handler_runner->continue_lock();
+              auto lock = connection->handler_runner->continueLock();
               if(!lock)
                 return;
               if(!ec) {
@@ -498,7 +498,7 @@ namespace SimpleWeb {
           else if(length == 127) {
             // 8 next bytes is the size of content
             asio::async_read(*connection->socket, connection->message->streambuf, asio::transfer_exactly(8), [this, connection](const error_code &ec, std::size_t /*bytes_transferred*/) {
-              auto lock = connection->handler_runner->continue_lock();
+              auto lock = connection->handler_runner->continueLock();
               if(!lock)
                 return;
               if(!ec) {
@@ -538,7 +538,7 @@ namespace SimpleWeb {
         return;
       }
       asio::async_read(*connection->socket, connection->message->streambuf, asio::transfer_exactly(connection->message->length), [this, connection](const error_code &ec, std::size_t /*bytes_transferred*/) {
-        auto lock = connection->handler_runner->continue_lock();
+        auto lock = connection->handler_runner->continueLock();
         if(!lock)
           return;
         if(!ec) {
@@ -622,14 +622,14 @@ namespace SimpleWeb {
       connection->set_timeout(config.timeout_request);
       resolver->async_resolve(query, [this, connection, resolver](const error_code &ec, asio::ip::tcp::resolver::iterator it) {
         connection->cancel_timeout();
-        auto lock = connection->handler_runner->continue_lock();
+        auto lock = connection->handler_runner->continueLock();
         if(!lock)
           return;
         if(!ec) {
           connection->set_timeout(this->config.timeout_request);
           asio::async_connect(*connection->socket, it, [this, connection, resolver](const error_code &ec, asio::ip::tcp::resolver::iterator /*it*/) {
             connection->cancel_timeout();
-            auto lock = connection->handler_runner->continue_lock();
+            auto lock = connection->handler_runner->continueLock();
             if(!lock)
               return;
             if(!ec) {
