@@ -640,68 +640,73 @@ class SocketServerBase {
                              if (length == 126) {
                                  // if length == 126 means
                                  // 2 next bytes is the size of content
-                                 asio::async_read(
-                                     *connection->socket,
-                                     connection->readBuffer,
-                                     asio::transfer_exactly(2),
-                                     [this, connection, &endpoint, fin_rsv_opcode](const ErrorCode &ec, std::size_t) {
-                                       auto sublock = connection->handlerRunner->continueLock();
-                                       if (!sublock) {
-                                           return;
-                                       }
+                                 connection->strand.wrap([this, connection, &endpoint, fin_rsv_opcode]() {
+                                   asio::async_read(
+                                       *connection->socket,
+                                       connection->readBuffer,
+                                       asio::transfer_exactly(2),
+                                       [this, connection, &endpoint, fin_rsv_opcode](const ErrorCode &ec, std::size_t) {
+                                         auto sublock = connection->handlerRunner->continueLock();
+                                         if (!sublock) {
+                                             return;
+                                         }
 
-                                       if (ec) {
-                                           onConnectionError(connection, endpoint, ec);
-                                           return;
-                                       }
+                                         if (ec) {
+                                             onConnectionError(connection, endpoint, ec);
+                                             return;
+                                         }
 
-                                       std::istream readStream(&connection->readBuffer);
+                                         std::istream readStream(&connection->readBuffer);
 
-                                       std::vector<unsigned char> lengthBytes(2);
-                                       readStream.read((char *) &lengthBytes[0], 2);
+                                         std::vector<unsigned char> lengthBytes(2);
+                                         readStream.read((char *) &lengthBytes[0], 2);
 
-                                       std::size_t toReadLength = 0;
-                                       std::size_t numBytes = 2;
-                                       for (std::size_t c = 0; c < numBytes; c++) {
-                                           toReadLength +=
-                                               static_cast<std::size_t>(lengthBytes[c]) << (8 * (numBytes - 1 - c));
-                                       }
+                                         std::size_t toReadLength = 0;
+                                         std::size_t numBytes = 2;
+                                         for (std::size_t c = 0; c < numBytes; c++) {
+                                             toReadLength +=
+                                                 static_cast<std::size_t>(lengthBytes[c]) << (8 * (numBytes - 1 - c));
+                                         }
 
-                                       // now we know real content length, reading whole message
-                                       readMessageContent(connection, toReadLength, endpoint, fin_rsv_opcode);
-                                     });
+                                         // now we know real content length, reading whole message
+                                         readMessageContent(connection, toReadLength, endpoint, fin_rsv_opcode);
+                                       });
+                                 });
+
                              } else if (length == 127) {
                                  // 8 next bytes is the size of content
-                                 asio::async_read(
-                                     *connection->socket,
-                                     connection->readBuffer,
-                                     asio::transfer_exactly(8),
-                                     [this, connection, &endpoint, fin_rsv_opcode](const ErrorCode &ec, std::size_t) {
-                                       auto lock = connection->handlerRunner->continueLock();
-                                       if (!lock) {
-                                           return;
-                                       }
+                                 connection->strand.wrap([this, connection, &endpoint, fin_rsv_opcode]() {
+                                   asio::async_read(
+                                       *connection->socket,
+                                       connection->readBuffer,
+                                       asio::transfer_exactly(8),
+                                       [this, connection, &endpoint, fin_rsv_opcode](const ErrorCode &ec, std::size_t) {
+                                         auto lock = connection->handlerRunner->continueLock();
+                                         if (!lock) {
+                                             return;
+                                         }
 
-                                       if (ec) {
-                                           onConnectionError(connection, endpoint, ec);
-                                           return;
-                                       }
+                                         if (ec) {
+                                             onConnectionError(connection, endpoint, ec);
+                                             return;
+                                         }
 
-                                       std::istream readStream(&connection->readBuffer);
+                                         std::istream readStream(&connection->readBuffer);
 
-                                       std::vector<unsigned char> lengthBytes(8);
-                                       readStream.read((char *) &lengthBytes[0], 8);
+                                         std::vector<unsigned char> lengthBytes(8);
+                                         readStream.read((char *) &lengthBytes[0], 8);
 
-                                       std::size_t toReadLength = 0;
-                                       std::size_t num_bytes = 8;
-                                       for (std::size_t c = 0; c < num_bytes; c++) {
-                                           toReadLength +=
-                                               static_cast<std::size_t>(lengthBytes[c]) << (8 * (num_bytes - 1 - c));
-                                       }
+                                         std::size_t toReadLength = 0;
+                                         std::size_t num_bytes = 8;
+                                         for (std::size_t c = 0; c < num_bytes; c++) {
+                                             toReadLength +=
+                                                 static_cast<std::size_t>(lengthBytes[c]) << (8 * (num_bytes - 1 - c));
+                                         }
 
-                                       // now we know real content length, reading whole message
-                                       readMessageContent(connection, toReadLength, endpoint, fin_rsv_opcode);
-                                     });
+                                         // now we know real content length, reading whole message
+                                         readMessageContent(connection, toReadLength, endpoint, fin_rsv_opcode);
+                                       });
+                                 });
                              } else {
                                  // real message content length is that length that we have now
                                  readMessageContent(connection, length, endpoint, fin_rsv_opcode);
@@ -724,67 +729,70 @@ class SocketServerBase {
             return;
         }
 
-        asio::async_read(*connection->socket,
-                         connection->readBuffer,
-                         asio::transfer_exactly(4 + length),
-                         [this, connection, length, &endpoint, fin_rsv_opcode](const ErrorCode &ec, std::size_t) {
-                           auto lock = connection->handlerRunner->continueLock();
-                           if (!lock) {
-                               return;
-                           }
+        connection->strand.post([this, connection, &endpoint, length, fin_rsv_opcode] {
+          asio::async_read(
+              *connection->socket,
+              connection->readBuffer,
+              asio::transfer_exactly(4 + length),
+              [this, connection, length, &endpoint, fin_rsv_opcode](const ErrorCode &ec, std::size_t) {
+                auto lock = connection->handlerRunner->continueLock();
+                if (!lock) {
+                    return;
+                }
 
-                           if (ec) {
-                               onConnectionError(connection, endpoint, ec);
-                               return;
-                           }
+                if (ec) {
+                    onConnectionError(connection, endpoint, ec);
+                    return;
+                }
 
-                           std::istream rawMessageData(&connection->readBuffer);
+                std::istream rawMessageData(&connection->readBuffer);
 
-                           // Read mask
-                           std::vector<unsigned char> mask(4);
-                           rawMessageData.read((char *) &mask[0], 4);
+                // Read mask
+                std::vector<uint8_t> mask(4);
+                rawMessageData.read((char *) &mask[0], 4);
 
-                           std::shared_ptr<Message> message(new Message());
-                           message->length = length;
-                           message->fin_rsv_opcode = fin_rsv_opcode;
+                std::shared_ptr<Message> message(new Message());
+                message->length = length;
+                message->fin_rsv_opcode = fin_rsv_opcode;
 
-                           std::ostream messageDataOutStream(&message->streambuf);
-                           for (std::size_t c = 0; c < length; c++) {
-                               messageDataOutStream.put(rawMessageData.get() ^ mask[c % 4]);
-                           }
+                std::ostream messageDataOutStream(&message->streambuf);
+                for (std::size_t c = 0; c < length; c++) {
+                    messageDataOutStream.put(rawMessageData.get() ^ mask[c % 4]);
+                }
 
-                           // If connection close
-                           if ((fin_rsv_opcode & 0x0f) == 8) {
-                               int status = 0;
-                               if (length >= 2) {
-                                   unsigned char byte1 = static_cast<unsigned char>(message->get());
-                                   unsigned char byte2 = static_cast<unsigned char>(message->get());
-                                   status = (byte1 << 8) + byte2;
-                               }
+                // If connection close
+                if ((fin_rsv_opcode & 0x0f) == 8) {
+                    int status = 0;
+                    if (length >= 2) {
+                        unsigned char byte1 = static_cast<unsigned char>(message->get());
+                        unsigned char byte2 = static_cast<unsigned char>(message->get());
+                        status = (byte1 << 8) + byte2;
+                    }
 
-                               auto reason = message->string();
-                               connection->sendClose(status, reason);
-                               connectionClose(connection, endpoint, status, reason);
-                               return;
-                           } else {
-                               // If ping
-                               if ((fin_rsv_opcode & 0x0f) == 9) {
-                                   // Send pong
-                                   auto empty_send_stream = std::make_shared<SendStream>();
-                                   connection->send(std::move(empty_send_stream),
-                                                    nullptr,
-                                                    static_cast<unsigned char>(fin_rsv_opcode + 1));
-                               } else if (endpoint.onMessage) {
-                                   connection->timeoutCancel();
-                                   connection->timeoutSet();
-                                   endpoint.onMessage(connection, message);
-                               }
+                    auto reason = message->string();
+                    connection->sendClose(status, reason);
+                    connectionClose(connection, endpoint, status, reason);
+                    return;
+                } else {
+                    // If ping
+                    if ((fin_rsv_opcode & 0x0f) == 9) {
+                        // Send pong
+                        auto empty_send_stream = std::make_shared<SendStream>();
+                        connection->send(std::move(empty_send_stream),
+                                         nullptr,
+                                         static_cast<unsigned char>(fin_rsv_opcode + 1));
+                    } else if (endpoint.onMessage) {
+                        connection->timeoutCancel();
+                        connection->timeoutSet();
+                        endpoint.onMessage(connection, message);
+                    }
 
-                               // Next message
-                               readMessage(connection, endpoint);
-                           }
+                    // Next message
+                    readMessage(connection, endpoint);
+                }
 
-                         });
+              });
+        });
     }
 
     void onConnectionOpen(const std::shared_ptr<Connection> &connection, Endpoint &endpoint) const {
