@@ -640,7 +640,6 @@ class SocketServerBase {
                              if (length == 126) {
                                  // if length == 126 means
                                  // 2 next bytes is the size of content
-                                 connection->strand.wrap([this, connection, &endpoint, fin_rsv_opcode]() {
                                    asio::async_read(
                                        *connection->socket,
                                        connection->readBuffer,
@@ -671,11 +670,9 @@ class SocketServerBase {
                                          // now we know real content length, reading whole message
                                          readMessageContent(connection, toReadLength, endpoint, fin_rsv_opcode);
                                        });
-                                 });
 
                              } else if (length == 127) {
                                  // 8 next bytes is the size of content
-                                 connection->strand.wrap([this, connection, &endpoint, fin_rsv_opcode]() {
                                    asio::async_read(
                                        *connection->socket,
                                        connection->readBuffer,
@@ -705,7 +702,6 @@ class SocketServerBase {
 
                                          // now we know real content length, reading whole message
                                          readMessageContent(connection, toReadLength, endpoint, fin_rsv_opcode);
-                                       });
                                  });
                              } else {
                                  // real message content length is that length that we have now
