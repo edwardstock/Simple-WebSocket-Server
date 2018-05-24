@@ -111,20 +111,22 @@ class SocketServerBase {
         }
 
         unsigned long getId() const {
-            return id;
+            return id.load(std::memory_order::memory_order_acquire);
         }
 
         unsigned long getUniqueId() const {
-            if (uniqueId != 0) {
-                return uniqueId;
+            const uint64_t v = uniqueId.load(std::memory_order::memory_order_acquire);
+            if (v != 0) {
+                return v;
             }
 
             using toolboxpp::strings::substringReplaceAll;
             std::stringstream ss;
             ss << substringReplaceAll(".", "", remoteEndpointAddress()) << remoteEndpointPort();
-            uniqueId = std::stoul(ss.str());
+            const uint64_t nv = std::stoul(ss.str());
+            uniqueId.store(nv);
 
-            return uniqueId;
+            return nv;
         }
 
      private:
@@ -147,6 +149,7 @@ class SocketServerBase {
             : handlerRunner(std::move(handler_runner)),
               socket(new socket_type(std::forward<Args>(args)...)),
               closed(false),
+              uniqueId(0),
               timeoutIdle(timeout_idle),
               strand(socket->get_io_service()) { }
 
@@ -155,12 +158,13 @@ class SocketServerBase {
         /// \brief Socket must be unique_ptr since asio::ssl::stream<asio::ip::tcp::socket> is not movable
         std::unique_ptr<socket_type> socket;
         std::mutex socketCloseMutex;
+        std::mutex readIdMutex;
         std::list<SendData> sendQueue;
         asio::streambuf readBuffer;
         std::atomic<bool> closed;
 
-        unsigned long id;
-        mutable unsigned long uniqueId = 0;
+        std::atomic<uint64_t> id;
+        mutable std::atomic<uint64_t> uniqueId;
         long timeoutIdle;
         std::unique_ptr<asio::steady_timer> timer;
         std::mutex timerMutex;
