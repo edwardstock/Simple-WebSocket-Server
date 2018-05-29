@@ -108,25 +108,19 @@ class SocketServerBase {
 
         void setId(unsigned long _id) {
             id = _id;
-        }
-
-        unsigned long getId() const {
-            return id.load(std::memory_order::memory_order_acquire);
-        }
-
-        unsigned long getUniqueId() const {
-            const uint64_t v = uniqueId.load(std::memory_order::memory_order_acquire);
-            if (v != 0) {
-                return v;
-            }
 
             using toolboxpp::strings::substringReplaceAll;
             std::stringstream ss;
             ss << substringReplaceAll(".", "", remoteEndpointAddress()) << remoteEndpointPort();
-            const uint64_t nv = std::stoul(ss.str());
-            uniqueId.store(nv);
+            uniqueId.store(std::stoul(ss.str()));
+        }
 
-            return nv;
+        unsigned long getId() const {
+            return id.load();
+        }
+
+        unsigned long getUniqueId() const {
+            return uniqueId.load();
         }
 
      private:
@@ -164,7 +158,7 @@ class SocketServerBase {
         std::atomic<bool> closed;
 
         std::atomic<uint64_t> id;
-        mutable std::atomic<uint64_t> uniqueId;
+        std::atomic<uint64_t> uniqueId;
         long timeoutIdle;
         std::unique_ptr<asio::steady_timer> timer;
         std::mutex timerMutex;
