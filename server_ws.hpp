@@ -112,15 +112,15 @@ class SocketServerBase {
             using toolboxpp::strings::substringReplaceAll;
             std::stringstream ss;
             ss << substringReplaceAll(".", "", remoteEndpointAddress()) << remoteEndpointPort();
-            uniqueId.store(std::stoul(ss.str()));
+            uniqueId = std::stoul(ss.str());
         }
 
         unsigned long getId() const {
-            return id.load();
+            return id;
         }
 
         unsigned long getUniqueId() const {
-            return uniqueId.load();
+            return uniqueId;
         }
 
      private:
@@ -157,8 +157,8 @@ class SocketServerBase {
         asio::streambuf readBuffer;
         std::atomic<bool> closed;
 
-        std::atomic<uint64_t> id;
-        std::atomic<uint64_t> uniqueId;
+        uint64_t id;
+        uint64_t uniqueId;
         long timeoutIdle;
         std::unique_ptr<asio::steady_timer> timer;
         std::mutex timerMutex;
